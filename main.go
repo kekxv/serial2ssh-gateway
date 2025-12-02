@@ -121,7 +121,10 @@ func runGateway(portName string) {
 		DataBits: 8,
 		Parity:   serial.NoParity,
 		StopBits: serial.OneStopBit,
-		// Ensure flow control is disabled for Zmodem transparency
+		// go.bug.st/serial library generally operates in a "raw" mode which typically disables
+		// software (XON/XOFF) and hardware (RTS/CTS) flow control by default.
+		// This is crucial for Zmodem transparency as specified in requirements.
+		// No explicit flow control parameters are exposed in serial.Mode.
 	}
 
 	// Open port

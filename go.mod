@@ -1,6 +1,6 @@
 module serial2ssh-gateway
 
-go 1.25.4
+go 1.20
 
 require (
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
