@@ -141,42 +141,145 @@ func runGateway(portName string) {
 
 	// Main Loop
 	for {
+		// Clear screen before sending welcome message
+		writeSerial(port, "\x1b[2J\x1b[H") // VT100 clear screen and move cursor to home
+
 		// Welcome Message
 		writeSerial(port, "\r\n\r\n========================================\r\n")
 		writeSerial(port, "      Serial-to-SSH Gateway v1.0        \r\n")
 		writeSerial(port, "========================================\r\n")
 		writeSerial(port, "Please enter connection details.\r\n")
 
-		// 1. Get IP
-	host, err := prompt(port, "Target Host (e.g. 192.168.1.1:22): ", false)
-		if err != nil {
-			continue
-		}
-		if host == "" {
-			writeSerial(port, "Host cannot be empty.\r\n")
-			continue
-		}
-		if !strings.Contains(host, ":") {
-			host = host + ":22"
-		}
-
-		// 2. Get User
-		user, err := prompt(port, "Username: ", false)
-		if err != nil {
-			continue
-		}
-
-		// 3. Get Password
-		pass, err := prompt(port, "Password: ", true)
-		if err != nil {
-			continue
-		}
-
-		writeSerial(port, "\r\nConnecting to "+host+"...\r\n")
-		sendLog("Initiating connection to %s@%s", user, host)
+				// 1. Get IP
+				host, err := prompt(port, "Target Host (e.g. 192.168.1.1:22): ", false)
+				if err != nil {
+		            if err.Error() == "input cancelled" {
+		                writeSerial(port, "\r\nInput cancelled.\r\n")
+		            } else {
+					    writeSerial(port, fmt.Sprintf("Error reading host: %v\r\n", err))
+		            }
+					continue
+				}
+				if host == "" {
+					writeSerial(port, "Host cannot be empty.\r\n")
+					continue
+				}
+				if !strings.Contains(host, ":") {
+					host = host + ":22"
+				}
+		
+				// 2. Get User
+				user, err := prompt(port, "Username: ", false)
+				if err != nil {
+		            if err.Error() == "input cancelled" {
+		                writeSerial(port, "\r\nInput cancelled.\r\n")
+		            } else {
+					    writeSerial(port, fmt.Sprintf("Error reading username: %v\r\n", err))
+		            }
+					continue
+				}
+		
+				// 3. Get Password or Key
+				pass, err := prompt(port, "Password (leave empty for Private Key): ", true)
+				if err != nil {
+		            if err.Error() == "input cancelled" {
+		                writeSerial(port, "\r\nInput cancelled.\r\n")
+		            } else {
+					    writeSerial(port, fmt.Sprintf("Error reading password: %v\r\n", err))
+		            }
+					continue
+				}
+		
+				var authMethods []ssh.AuthMethod
+				var authTypeLog string
+		
+				if pass != "" {
+					// --- Password Mode ---
+					authMethods = []ssh.AuthMethod{ssh.Password(pass)}
+					authTypeLog = "password"
+				} else {
+					// --- Private Key Mode ---
+					// Ask user for method
+					method, err := prompt(port, "Press [Enter] to Paste Key, or type 'f' for File Path: ", false)
+					if err != nil {
+		                if err.Error() == "input cancelled" {
+		                    writeSerial(port, "\r\nInput cancelled.\r\n")
+		                } else {
+						    writeSerial(port, fmt.Sprintf("Error reading method: %v\r\n", err))
+		                }
+						continue
+					}
+		
+					var keyBytes []byte
+		
+					if strings.ToLower(strings.TrimSpace(method)) == "f" {
+						// File Path Mode
+						keyPath, err := prompt(port, "Private Key Path (on server): ", false)
+						if err != nil {
+		                    if err.Error() == "input cancelled" {
+		                        writeSerial(port, "\r\nInput cancelled.\r\n")
+		                    } else {
+							    writeSerial(port, fmt.Sprintf("Error reading key path: %v\r\n", err))
+		                    }
+							continue
+						}
+						if keyPath == "" {
+							writeSerial(port, "Key path cannot be empty.\r\n")
+							continue
+						}
+						keyBytes, err = os.ReadFile(keyPath)
+						if err != nil {
+							writeSerial(port, fmt.Sprintf("Error reading key file: %v\r\n", err))
+							continue
+						}
+					} else {
+						// Paste Mode
+						writeSerial(port, "Please paste your Private Key now.\r\n")
+						writeSerial(port, "(waiting for '-----END ... PRIVATE KEY-----' line)\r\n")
+						keyBytes, err = readKeyFromSerial(port)
+						if err != nil {
+		                                    if err.Error() == "input cancelled" {
+		                                        writeSerial(port, "\r\nInput cancelled.\r\n")
+		                                    } else {
+											    writeSerial(port, fmt.Sprintf("Error reading key: %v\r\n", err))
+		                                    }
+											continue
+										}
+										writeSerial(port, "\r\nKey received.\r\n")
+									}
+						
+									// Parse Key (Common logic)
+									signer, err := ssh.ParsePrivateKey(keyBytes)
+									if err != nil {
+										// Check for encryption
+										if strings.Contains(err.Error(), "cannot decode") || strings.Contains(err.Error(), "encrypted") || strings.Contains(err.Error(), "passphrase protected") {
+											passphrase, err := prompt(port, "Key Passphrase: ", true)
+											if err != nil {
+		                                        if err.Error() == "input cancelled" {
+		                                            writeSerial(port, "\r\nInput cancelled.\r\n")
+		                                        } else {
+		                                            writeSerial(port, fmt.Sprintf("Error reading passphrase: %v\r\n", err))
+		                                        }
+																							continue
+																						}
+																						signer, err = ssh.ParsePrivateKeyWithPassphrase(keyBytes, []byte(passphrase))
+																						if err != nil {
+																							writeSerial(port, fmt.Sprintf("Failed to parse encrypted key: %v\r\n", err))
+																							continue
+																						}
+																					} else { // This else belongs to the inner if (encryption check)
+																						writeSerial(port, fmt.Sprintf("Failed to parse key: %v\r\n", err))
+																						continue
+																					}
+																				} // This brace closes the 'if err != nil' block for ParsePrivateKey
+																				authMethods = []ssh.AuthMethod{ssh.PublicKeys(signer)}
+																				authTypeLog = "private key"
+																			} // This brace closes the 'else' for (pass != "")				
+						writeSerial(port, "\r\nConnecting to "+host+"...\r\n")
+		sendLog("Initiating connection to %s@%s using %s", user, host, authTypeLog)
 
 		// 4. Connect SSH
-	err = connectSSH(port, host, user, pass)
+		err = connectSSH(port, host, user, authMethods)
 		if err != nil {
 			writeSerial(port, fmt.Sprintf("\r\nConnection Error: %v\r\n", err))
 			sendLog("SSH Connection failed: %v", err)
@@ -188,12 +291,10 @@ func runGateway(portName string) {
 	}
 }
 
-func connectSSH(serialPort serial.Port, host, user, password string) error {
+func connectSSH(serialPort serial.Port, host, user string, authMethods []ssh.AuthMethod) error {
 	config := &ssh.ClientConfig{
 		User: user,
-		Auth: []ssh.AuthMethod{
-			ssh.Password(password),
-		},
+		Auth: authMethods,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // Note: In production, should verify keys
 		Timeout:         10 * time.Second,
 	}
@@ -261,6 +362,11 @@ func prompt(port io.ReadWriter, question string, mask bool) (string, error) {
 			return "", err
 		}
 
+        // Check for Ctrl+C (ETX - End of Text)
+        if b == 0x03 {
+            return "", fmt.Errorf("input cancelled")
+        }
+
 		// Handle Enter (\r or \n)
 		if b == '\r' || b == '\n' {
 			writeSerial(port, "\r\n") // Echo newline
@@ -295,6 +401,45 @@ func prompt(port io.ReadWriter, question string, mask bool) (string, error) {
 func waitForLog() tea.Cmd {
     // Placeholder. Actual logging is pushed via global program.
     return nil
+}
+
+// readKeyFromSerial reads lines until it sees the private key footer or detects Ctrl+C
+func readKeyFromSerial(port io.ReadWriter) ([]byte, error) {
+	reader := bufio.NewReader(port)
+	var sb strings.Builder
+	var lineBuf strings.Builder
+	
+	for {
+		b, err := reader.ReadByte()
+		if err != nil {
+			return nil, err
+		}
+
+        // Check for Ctrl+C (ETX - End of Text)
+        if b == 0x03 {
+            return nil, fmt.Errorf("input cancelled")
+        }
+
+		// Accumulate char
+		lineBuf.WriteByte(b)
+
+		// Check for line end
+		if b == '\n' || b == '\r' {
+			line := lineBuf.String()
+			sb.WriteString(line)
+			
+			// Echo a dot for progress
+			writeSerial(port, ".")
+
+			// Check for end of key in the current accumulated line
+			if strings.Contains(line, "-----END") && strings.Contains(line, "PRIVATE KEY-----") {
+				break
+			}
+			
+			lineBuf.Reset()
+		}
+	}
+	return []byte(sb.String()), nil
 }
 
 func main() {

@@ -23,19 +23,18 @@
             border-bottom: 1px solid #3e3e3e;
             display: flex;
             align-items: center;
-            gap: 10px;
+            gap: 5px; /* Reduced gap */
             flex-wrap: wrap;
         }
         h1 {
             margin: 0;
             font-size: 1.2rem;
             margin-right: auto;
-            white-space: nowrap;
         }
         #terminal-container {
             flex: 1;
-            padding: 10px;
-            overflow: hidden; /* xterm handles scroll */
+            /* Remove padding from container, let xterm fill it and use its internal padding/margin if needed */
+            overflow: hidden;
         }
         button {
             background-color: #238636;
@@ -117,6 +116,13 @@
         <button id="connectBleBtn" class="ble">BLE Connect</button>
     </div>
 
+    <!-- Active Session Controls (Hidden until connected) -->
+    <div id="activeSessionControls" class="hidden" style="display: flex; gap: 10px; align-items: center;">
+        <div class="separator"></div>
+        <button id="sendKeyBtn" title="Upload Private Key File" style="background-color: #238636;">Key 🔑</button>
+        <input type="file" id="keyFileUpload" style="display: none;" />
+    </div>
+
     <div class="separator"></div>
 
     <!-- Collab Controls -->
@@ -166,6 +172,7 @@
     const termContainer = document.getElementById('terminal-container');
     const serialControls = document.getElementById('serialControls');
     const bleControls = document.getElementById('bleControls');
+    const activeSessionControls = document.getElementById('activeSessionControls');
     const collabControls = document.getElementById('collabControls');
     const shareBtn = document.getElementById('shareBtn');
     const joinBtn = document.getElementById('joinBtn');
@@ -357,9 +364,19 @@
             }
         }
 
-        write(data) {
-            if (this.writer) {
-                this.writer.write(data);
+        async write(data) {
+            if (!this.writer) return;
+            
+            // Chunking for Serial is also good practice to prevent buffer overflow on receiver
+            const CHUNK_SIZE = 128; // Can be larger than BLE, but safe limit
+            
+            for (let i = 0; i < data.length; i += CHUNK_SIZE) {
+                const chunk = data.slice(i, i + CHUNK_SIZE);
+                await this.writer.write(chunk);
+                // Tiny delay to let the event loop breathe and hardware catch up
+                if (data.length > CHUNK_SIZE) {
+                    await new Promise(r => setTimeout(r, 5));
+                }
             }
         }
 
@@ -482,17 +499,26 @@
             
             const encoder = new TextEncoder('utf-8');
             const array = encoder.encode(data);
-            
-            try {
-                // Try WriteWithoutResponse first (faster)
-                await this.rxChar.writeValueWithoutResponse(array);
-            } catch (err) {
-                // Fallback to regular Write
-                 try {
-                     await this.rxChar.writeValue(array);
-                 } catch (retryErr) {
-                     term.writeln(`\r\n\x1b[1;31mBLE Write Error: ${retryErr.message}\x1b[0m`);
-                 }
+            const CHUNK_SIZE = 20; // Safe default MTU payload for BLE 4.0+
+
+            for (let i = 0; i < array.length; i += CHUNK_SIZE) {
+                const chunk = array.slice(i, i + CHUNK_SIZE);
+                try {
+                    // Try WriteWithoutResponse first (faster)
+                    await this.rxChar.writeValueWithoutResponse(chunk);
+                } catch (err) {
+                    console.error("BLE WriteWithoutResponse Error:", err);
+                    // Fallback to regular Write
+                     try {
+                         await this.rxChar.writeValue(chunk);
+                     } catch (retryErr) {
+                         term.writeln(`\r\n\x1b[1;31mBLE Write Error: ${retryErr.message}\x1b[0m`);
+                         break; // Stop sending rest of message
+                     }
+                }
+                // Minimal delay to prevent flooding the stack if promises resolve too fast
+                // (though await writeValue is usually sufficient flow control)
+                // await new Promise(r => setTimeout(r, 5)); 
             }
         }
 
@@ -511,6 +537,52 @@
     connectSerialBtn.addEventListener('click', () => startConnection(new SerialTransport()));
     connectBleBtn.addEventListener('click', () => startConnection(new BLETransport()));
     disconnectBtn.addEventListener('click', disconnect);
+
+    // Key Upload Logic
+    const sendKeyBtn = document.getElementById('sendKeyBtn');
+    const keyFileUpload = document.getElementById('keyFileUpload');
+
+    sendKeyBtn.addEventListener('click', () => {
+        if (!transport) {
+            alert("Please connect to Serial or BLE first.");
+            return;
+        }
+        keyFileUpload.click();
+    });
+
+    keyFileUpload.addEventListener('change', (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        const reader = new FileReader();
+        reader.onload = async (ev) => {
+            const content = ev.target.result;
+            // Chunk size must be small to satisfy BLE MTU limits (often 20-200 bytes)
+            // and to prevent buffer overflows on the serial receiver.
+            const CHUNK_SIZE = 64; 
+            
+            term.writeln(`\r\n\x1b[1;34mSending Key (${content.length} bytes)...\x1b[0m`);
+            
+            for (let i = 0; i < content.length; i += CHUNK_SIZE) {
+                const chunk = content.slice(i, i + CHUNK_SIZE);
+                if (transport && transport.write) {
+                    await transport.write(chunk);
+                    // Small delay is crucial for flow control
+                    await new Promise(r => setTimeout(r, 20)); 
+                }
+            }
+
+            // Ensure a final newline is sent if missing, to trigger backend line processing
+            if (!content.endsWith('\n') && !content.endsWith('\r')) {
+                 if (transport && transport.write) await transport.write("\n");
+            }
+            
+            term.writeln(`\r\n\x1b[1;32mKey Sent!\x1b[0m`);
+            // Reset input so we can upload same file again if needed
+            keyFileUpload.value = '';
+        };
+        reader.readAsText(file);
+    });
 
     // Collab Listeners
     shareBtn.addEventListener('click', async () => {
@@ -574,6 +646,10 @@
             
             serialControls.classList.add('hidden');
             bleControls.classList.add('hidden');
+            
+            activeSessionControls.classList.remove('hidden');
+            activeSessionControls.style.display = 'flex'; // Force flex layout
+            
             disconnectBtn.classList.remove('hidden');
             
             term.writeln(`\r\n\x1b[1;32mConnected via ${statusText}!\x1b[0m`);
@@ -597,6 +673,10 @@
         
         serialControls.classList.remove('hidden');
         bleControls.classList.remove('hidden');
+        
+        activeSessionControls.classList.add('hidden');
+        activeSessionControls.style.display = 'none'; // Ensure hidden
+        
         disconnectBtn.classList.add('hidden');
         
         term.writeln('\r\n\x1b[1;33mDisconnected.\x1b[0m');
