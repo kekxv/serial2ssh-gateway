@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - "main"
+    tags:
+      - "v*" # Trigger only on version tags (e.g., v1.0.0)
+  workflow_dispatch: # Allow manual triggering
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            output_name: serial2ssh-gateway-windows-amd64.exe
+            asset_name: serial2ssh-gateway-windows-amd64.zip
+          - goos: windows
+            goarch: 386
+            output_name: serial2ssh-gateway-windows-386.exe
+            asset_name: serial2ssh-gateway-windows-386.zip
+          - goos: linux
+            goarch: amd64
+            output_name: serial2ssh-gateway-linux-amd64
+            asset_name: serial2ssh-gateway-linux-amd64.tar.gz
+          - goos: darwin
+            goarch: amd64
+            output_name: serial2ssh-gateway-macos-amd64
+            asset_name: serial2ssh-gateway-macos-amd64.tar.gz
+          - goos: darwin
+            goarch: arm64
+            output_name: serial2ssh-gateway-macos-arm64
+            asset_name: serial2ssh-gateway-macos-arm64.tar.gz
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23' # Use a stable modern Go version
+
+      - name: Build Binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0 # Static build for compatibility
+        run: |
+          go build -ldflags="-s -w" -o ${{ matrix.output_name }} main.go
+
+      - name: Package (Windows)
+        if: matrix.goos == 'windows'
+        run: |
+          zip ${{ matrix.asset_name }} ${{ matrix.output_name }}
+
+      - name: Package (Linux/macOS)
+        if: matrix.goos != 'windows'
+        run: |
+          tar -czvf ${{ matrix.asset_name }} ${{ matrix.output_name }}
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: ${{ matrix.asset_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Artifact (Non-Tag Builds)
+        uses: actions/upload-artifact@v4
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+          retention-days: 5
