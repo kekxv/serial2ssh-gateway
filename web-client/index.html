@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Web Serial & BLE Terminal</title>
+    <!-- xterm.js CSS -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #1e1e1e;
+            color: #c9d1d9;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            margin: 0;
+            overflow: hidden;
+        }
+        header {
+            padding: 10px 20px;
+            background-color: #2d2d2d;
+            border-bottom: 1px solid #3e3e3e;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        h1 {
+            margin: 0;
+            font-size: 1.2rem;
+            margin-right: auto;
+            white-space: nowrap;
+        }
+        #terminal-container {
+            flex: 1;
+            padding: 10px;
+            overflow: hidden; /* xterm handles scroll */
+        }
+        button {
+            background-color: #238636;
+            color: white;
+            border: none;
+            padding: 6px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            white-space: nowrap;
+        }
+        button:hover {
+            background-color: #2ea043;
+        }
+        button:disabled {
+            background-color: #444;
+            cursor: not-allowed;
+        }
+        button.ble {
+            background-color: #0078d7;
+        }
+        button.ble:hover {
+            background-color: #1084e3;
+        }
+        button.disconnect {
+            background-color: #da3633;
+        }
+        button.disconnect:hover {
+            background-color: #f85149;
+        }
+        select, input {
+            padding: 5px;
+            border-radius: 4px;
+            background: #0d1117;
+            color: #c9d1d9;
+            border: 1px solid #30363d;
+        }
+        .status {
+            font-size: 0.85rem;
+            color: #8b949e;
+            white-space: nowrap;
+        }
+        .separator {
+            width: 1px;
+            height: 24px;
+            background-color: #3e3e3e;
+            margin: 0 5px;
+        }
+        /* Hidden class for toggling visibility */
+        .hidden {
+            display: none !important;
+        }
+    </style>
+</head>
+<body>
+
+<header>
+    <h1>Web Console</h1>
+    <span id="statusMsg" class="status">Disconnected</span>
+    
+    <div class="separator"></div>
+
+    <!-- Serial Controls -->
+    <div id="serialControls" style="display: flex; gap: 10px; align-items: center;">
+        <select id="baudRate">
+            <option value="9600">9600</option>
+            <option value="19200">19200</option>
+            <option value="38400">38400</option>
+            <option value="57600">57600</option>
+            <option value="115200" selected>115200</option>
+        </select>
+        <button id="connectSerialBtn">Serial Connect</button>
+    </div>
+
+    <div class="separator"></div>
+
+    <!-- BLE Controls -->
+    <div id="bleControls" style="display: flex; gap: 10px; align-items: center;">
+        <button id="connectBleBtn" class="ble">BLE Connect</button>
+    </div>
+
+    <button id="disconnectBtn" class="disconnect hidden">Disconnect</button>
+
+</header>
+
+<div id="terminal-container"></div>
+
+<!-- xterm.js Library -->
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.js"></script>
+
+<script>
+    // --- Constants ---
+    // Nordic UART Service (NUS)
+    const NUS_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+    const NUS_RX_CHAR = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // Write
+    const NUS_TX_CHAR = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // Notify
+
+    // HM-10 / JDY-08 / CC2541 (Standard 16-bit UUIDs often expanded)
+    const HM10_SERVICE_UUID = '0000ffe0-0000-1000-8000-00805f9b34fb';
+    const HM10_CHAR_UUID    = '0000ffe1-0000-1000-8000-00805f9b34fb'; // Read/Write/Notify
+
+    // "KT" Style Service (from bluetooth.ts)
+    const KT_SERVICE_UUID = '0000fff0-0000-1000-8000-00805f9b34fb'; // 0xfff0
+    const KT_CHAR_UUID    = '0000fff1-0000-1000-8000-00805f9b34fb'; // 0xfff1
+
+    const OPTIONAL_SERVICES = [NUS_SERVICE_UUID, HM10_SERVICE_UUID, KT_SERVICE_UUID];
+
+    // --- UI Elements ---
+    const connectSerialBtn = document.getElementById('connectSerialBtn');
+    const connectBleBtn = document.getElementById('connectBleBtn');
+    const disconnectBtn = document.getElementById('disconnectBtn');
+    const baudRateSelect = document.getElementById('baudRate');
+    const statusMsg = document.getElementById('statusMsg');
+    const termContainer = document.getElementById('terminal-container');
+    const serialControls = document.getElementById('serialControls');
+    const bleControls = document.getElementById('bleControls');
+
+    // --- State ---
+    let transport = null; // Holds the active transport object (Serial or BLE)
+    
+    // --- Initialize xterm.js ---
+    const term = new Terminal({
+        cursorBlink: true,
+        theme: {
+            background: '#1e1e1e',
+            foreground: '#c9d1d9'
+        },
+        fontSize: 14,
+        fontFamily: 'Menlo, Monaco, "Courier New", monospace'
+    });
+    
+    const fitAddon = new FitAddon.FitAddon();
+    term.loadAddon(fitAddon);
+    term.loadAddon(new WebLinksAddon.WebLinksAddon());
+
+    term.open(termContainer);
+    fitAddon.fit();
+
+    window.addEventListener('resize', () => fitAddon.fit());
+
+    term.writeln('\x1b[1;32mWelcome to Web Serial & BLE Console!\x1b[0m');
+    term.writeln('Choose a connection method above to start.');
+
+    // --- Terminal Input Handling ---
+    term.onData((data) => {
+        if (transport && transport.write) {
+            transport.write(data);
+        }
+    });
+
+    // --- Transport Classes ---
+
+    class SerialTransport {
+        constructor() {
+            this.port = null;
+            this.reader = null;
+            this.inputDone = null;
+            this.outputDone = null;
+            this.outputStream = null;
+            this.writer = null;
+        }
+
+        async connect() {
+            if (!("serial" in navigator)) {
+                throw new Error("Web Serial API not supported.");
+            }
+            
+            this.port = await navigator.serial.requestPort();
+            const baudRate = parseInt(baudRateSelect.value);
+            await this.port.open({ baudRate: baudRate });
+
+            // Setup Write Stream
+            const encoder = new TextEncoderStream();
+            this.outputDone = encoder.readable.pipeTo(this.port.writable);
+            this.outputStream = encoder.writable;
+            this.writer = this.outputStream.getWriter();
+
+            // Setup Read Stream
+            const decoder = new TextDecoderStream();
+            this.inputDone = this.port.readable.pipeTo(decoder.writable);
+            this.reader = decoder.readable.getReader();
+
+            this.readLoop();
+            return `Serial (${baudRate})`;
+        }
+
+        async readLoop() {
+            while (true) {
+                try {
+                    const { value, done } = await this.reader.read();
+                    if (done) break;
+                    if (value) term.write(value);
+                } catch (error) {
+                    console.error('Serial Read Error', error);
+                    break;
+                }
+            }
+        }
+
+        write(data) {
+            if (this.writer) {
+                this.writer.write(data);
+            }
+        }
+
+        async disconnect() {
+            if (this.reader) {
+                await this.reader.cancel();
+                await this.inputDone.catch(() => {});
+                this.reader = null;
+                this.inputDone = null;
+            }
+            if (this.outputStream) {
+                await this.outputStream.close();
+                await this.outputDone;
+                this.outputStream = null;
+                this.outputDone = null;
+            }
+            if (this.port) {
+                await this.port.close();
+                this.port = null;
+            }
+        }
+    }
+
+    class BLETransport {
+        constructor() {
+            this.device = null;
+            this.rxChar = null; // We write to this
+            this.txChar = null; // We receive notifications from this
+        }
+
+        async connect() {
+            if (!("bluetooth" in navigator)) {
+                throw new Error("Web Bluetooth API not supported.");
+            }
+
+            // Request ANY device, but we must declare which services we might want to access
+            this.device = await navigator.bluetooth.requestDevice({
+                acceptAllDevices: true,
+                optionalServices: OPTIONAL_SERVICES
+            });
+
+            if (!this.device.gatt) {
+                throw new Error("Device does not support GATT.");
+            }
+
+            const server = await this.device.gatt.connect();
+            
+            // Service Discovery Logic
+            // Try Nordic NUS first, then HM-10, then KT
+            let service = null;
+            let type = '';
+
+            // 1. Nordic NUS
+            try {
+                service = await server.getPrimaryService(NUS_SERVICE_UUID);
+                this.rxChar = await service.getCharacteristic(NUS_RX_CHAR);
+                this.txChar = await service.getCharacteristic(NUS_TX_CHAR);
+                type = 'Nordic NUS';
+            } catch (e) {
+                console.log("NUS service not found.");
+            }
+
+            // 2. HM-10
+            if (!service) {
+                try {
+                    service = await server.getPrimaryService(HM10_SERVICE_UUID);
+                    const characteristic = await service.getCharacteristic(HM10_CHAR_UUID);
+                    this.rxChar = characteristic;
+                    this.txChar = characteristic;
+                    type = 'HM-10/JDY';
+                } catch (e) {
+                    console.log("HM-10 service not found.");
+                }
+            }
+
+            // 3. KT (from bluetooth.ts)
+            if (!service) {
+                try {
+                    service = await server.getPrimaryService(KT_SERVICE_UUID);
+                    const characteristic = await service.getCharacteristic(KT_CHAR_UUID);
+                    this.rxChar = characteristic;
+                    this.txChar = characteristic;
+                    type = 'KT/FFF0';
+                } catch (e) {
+                    console.log("KT service not found.");
+                }
+            }
+
+            if (!service || !this.rxChar || !this.txChar) {
+                throw new Error("No supported UART service found (checked Nordic NUS, HM-10 & KT).");
+            }
+
+            // Listen for updates
+            await this.txChar.startNotifications();
+            this.txChar.addEventListener('characteristicvaluechanged', this.handleNotifications.bind(this));
+            
+            this.device.addEventListener('gattserverdisconnected', () => {
+               term.writeln('\r\n\x1b[1;31mBLE Device Disconnected unexpectedly.\x1b[0m');
+               disconnect(); 
+            });
+
+            return `BLE (${this.device.name || 'Unknown'} - ${type})`;
+        }
+
+        handleNotifications(event) {
+            const value = event.target.value;
+            // Convert DataView to string (assuming UTF-8)
+            const decoder = new TextDecoder('utf-8');
+            const str = decoder.decode(value);
+            term.write(str);
+        }
+
+        async write(data) {
+            if (!this.rxChar) return;
+            
+            const encoder = new TextEncoder('utf-8');
+            const array = encoder.encode(data);
+            
+            try {
+                // Try WriteWithoutResponse first (faster)
+                await this.rxChar.writeValueWithoutResponse(array);
+            } catch (err) {
+                // Fallback to regular Write
+                 try {
+                     await this.rxChar.writeValue(array);
+                 } catch (retryErr) {
+                     term.writeln(`\r\n\x1b[1;31mBLE Write Error: ${retryErr.message}\x1b[0m`);
+                 }
+            }
+        }
+
+        async disconnect() {
+            if (this.device && this.device.gatt.connected) {
+                this.device.gatt.disconnect();
+            }
+            this.device = null;
+            this.rxChar = null;
+            this.txChar = null;
+        }
+    }
+
+    // --- Main Logic ---
+
+    connectSerialBtn.addEventListener('click', () => startConnection(new SerialTransport()));
+    connectBleBtn.addEventListener('click', () => startConnection(new BLETransport()));
+    disconnectBtn.addEventListener('click', disconnect);
+
+    async function startConnection(newTransport) {
+        try {
+            transport = newTransport;
+            const statusText = await transport.connect();
+            
+            // Update UI
+            statusMsg.textContent = `Connected: ${statusText}`;
+            statusMsg.style.color = '#2ea043';
+            
+            serialControls.classList.add('hidden');
+            bleControls.classList.add('hidden');
+            disconnectBtn.classList.remove('hidden');
+            
+            term.writeln(`\r\n\x1b[1;32mConnected via ${statusText}!\x1b[0m`);
+            term.focus();
+
+        } catch (err) {
+            console.error(err);
+            term.writeln(`\r\n\x1b[1;31mConnection Failed: ${err.message}\x1b[0m`);
+            transport = null;
+        }
+    }
+
+    async function disconnect() {
+        if (transport) {
+            await transport.disconnect();
+            transport = null;
+        }
+        
+        statusMsg.textContent = 'Disconnected';
+        statusMsg.style.color = '#8b949e';
+        
+        serialControls.classList.remove('hidden');
+        bleControls.classList.remove('hidden');
+        disconnectBtn.classList.add('hidden');
+        
+        term.writeln('\r\n\x1b[1;33mDisconnected.\x1b[0m');
+    }
+
+</script>
+
+</body>
+</html>
