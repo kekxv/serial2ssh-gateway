@@ -261,6 +261,9 @@
                     // Disable local transport controls if we are guest
                     serialControls.classList.add('hidden');
                     bleControls.classList.add('hidden');
+                    // Show activeSessionControls for Guest too
+                    activeSessionControls.classList.remove('hidden');
+                    activeSessionControls.style.display = 'flex';
                     break;
                 case 'term_data':
                     if (this.isGuest) {
@@ -288,6 +291,8 @@
                 serialControls.classList.remove('hidden');
                 bleControls.classList.remove('hidden');
             }
+            activeSessionControls.classList.add('hidden'); // Hide for all on disconnect
+            activeSessionControls.style.display = 'none';
         }
 
         createSession() {
@@ -342,10 +347,9 @@
             this.outputStream = encoder.writable;
             this.writer = this.outputStream.getWriter();
 
-            // Setup Read Stream
-            const decoder = new TextDecoderStream();
-            this.inputDone = this.port.readable.pipeTo(decoder.writable);
-            this.reader = decoder.readable.getReader();
+            // Setup Read Stream - Read raw bytes directly
+            this.reader = this.port.readable.getReader();
+            // No TextDecoderStream here to maintain binary transparency
 
             this.readLoop();
             return `Serial (${baudRate})`;
@@ -354,9 +358,16 @@
         async readLoop() {
             while (true) {
                 try {
-                    const { value, done } = await this.reader.read();
+                    const { value, done } = await this.reader.read(); // value is Uint8Array
                     if (done) break;
-                    if (value) term.write(value);
+                    if (value) {
+                        term.write(value); // xterm.js can handle Uint8Array
+                        // If we are hosting, broadcast this data as a string
+                        if (collab && collab.isHost) {
+                            const decodedString = new TextDecoder('utf-8').decode(value);
+                            collab.broadcastOutput(decodedString);
+                        }
+                    }
                 } catch (error) {
                     console.error('Serial Read Error', error);
                     break;
@@ -482,15 +493,14 @@
         }
 
         handleNotifications(event) {
-            const value = event.target.value;
-            // Convert DataView to string (assuming UTF-8)
-            const decoder = new TextDecoder('utf-8');
-            const str = decoder.decode(value);
-            term.write(str);
+            const value = event.target.value; // This is a DataView
+            const uint8Array = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+            term.write(uint8Array); // xterm.js can handle Uint8Array
             
-            // If we are hosting, broadcast this data
+            // If we are hosting, broadcast this data as a string
             if (collab && collab.isHost) {
-                collab.broadcastOutput(str);
+                const decodedString = new TextDecoder('utf-8').decode(uint8Array);
+                collab.broadcastOutput(decodedString);
             }
         }
 
@@ -543,6 +553,12 @@
     const keyFileUpload = document.getElementById('keyFileUpload');
 
     sendKeyBtn.addEventListener('click', () => {
+        // If collaborating as a Guest, allow sending key via collab
+        if (collab && collab.isGuest) {
+            keyFileUpload.click();
+            return;
+        }
+
         if (!transport) {
             alert("Please connect to Serial or BLE first.");
             return;
@@ -557,24 +573,30 @@
         const reader = new FileReader();
         reader.onload = async (ev) => {
             const content = ev.target.result;
-            // Chunk size must be small to satisfy BLE MTU limits (often 20-200 bytes)
-            // and to prevent buffer overflows on the serial receiver.
             const CHUNK_SIZE = 64; 
             
             term.writeln(`\r\n\x1b[1;34mSending Key (${content.length} bytes)...\x1b[0m`);
             
             for (let i = 0; i < content.length; i += CHUNK_SIZE) {
                 const chunk = content.slice(i, i + CHUNK_SIZE);
-                if (transport && transport.write) {
+                if (collab && collab.isGuest) {
+                    // If guest, send via collab manager
+                    collab.sendInput(chunk);
+                } else if (transport && transport.write) {
+                    // Else (host or local only), send via local transport
                     await transport.write(chunk);
-                    // Small delay is crucial for flow control
-                    await new Promise(r => setTimeout(r, 20)); 
                 }
+                // Small delay is crucial for flow control
+                await new Promise(r => setTimeout(r, 20)); 
             }
 
             // Ensure a final newline is sent if missing, to trigger backend line processing
             if (!content.endsWith('\n') && !content.endsWith('\r')) {
-                 if (transport && transport.write) await transport.write("\n");
+                 if (collab && collab.isGuest) {
+                    collab.sendInput("\n");
+                 } else if (transport && transport.write) {
+                    await transport.write("\n");
+                 }
             }
             
             term.writeln(`\r\n\x1b[1;32mKey Sent!\x1b[0m`);
