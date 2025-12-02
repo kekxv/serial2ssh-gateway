@@ -117,6 +117,18 @@
         <button id="connectBleBtn" class="ble">BLE Connect</button>
     </div>
 
+    <div class="separator"></div>
+
+    <!-- Collab Controls -->
+    <div id="collabControls" style="display: flex; gap: 10px; align-items: center;">
+        <input type="text" id="wsUrlInput" value="ws://localhost:8080" placeholder="ws://host:port" style="width: 150px; font-family: monospace; font-size: 0.8rem;">
+        <div class="separator"></div>
+        <input type="text" id="shareCodeInput" placeholder="Code" style="width: 120px; font-family: monospace;">
+        <button id="joinBtn" style="background-color: #8957e5;">Join</button>
+        <button id="shareBtn" style="background-color: #d29922;">Share</button>
+    </div>
+    <span id="collabStatus" class="status hidden" style="color: #d29922; font-weight: bold;"></span>
+
     <button id="disconnectBtn" class="disconnect hidden">Disconnect</button>
 
 </header>
@@ -154,9 +166,16 @@
     const termContainer = document.getElementById('terminal-container');
     const serialControls = document.getElementById('serialControls');
     const bleControls = document.getElementById('bleControls');
+    const collabControls = document.getElementById('collabControls');
+    const shareBtn = document.getElementById('shareBtn');
+    const joinBtn = document.getElementById('joinBtn');
+    const shareCodeInput = document.getElementById('shareCodeInput');
+    const wsUrlInput = document.getElementById('wsUrlInput');
+    const collabStatus = document.getElementById('collabStatus');
 
     // --- State ---
     let transport = null; // Holds the active transport object (Serial or BLE)
+    let collab = null;    // Holds the CollabManager
     
     // --- Initialize xterm.js ---
     const term = new Terminal({
@@ -183,10 +202,111 @@
 
     // --- Terminal Input Handling ---
     term.onData((data) => {
+        // Case 1: We are a Guest -> Send to Host via Collab
+        if (collab && collab.isGuest) {
+            collab.sendInput(data);
+            return;
+        }
+
+        // Case 2: We are the Host (or local user) -> Write to local transport
         if (transport && transport.write) {
             transport.write(data);
         }
     });
+
+    // --- Collab Manager ---
+    class CollabManager {
+        constructor(url) {
+            this.url = url;
+            this.ws = null;
+            this.isHost = false;
+            this.isGuest = false;
+        }
+
+        connect() {
+            return new Promise((resolve, reject) => {
+                this.ws = new WebSocket(this.url);
+                this.ws.onopen = () => resolve();
+                this.ws.onerror = (err) => reject(err);
+                this.ws.onmessage = this.handleMessage.bind(this);
+                this.ws.onclose = () => {
+                    this.handleDisconnect();
+                };
+            });
+        }
+
+        handleMessage(event) {
+            const msg = JSON.parse(event.data);
+            switch (msg.type) {
+                case 'created':
+                    this.isHost = true;
+                    this.isGuest = false;
+                    updateCollabUI(true, `Hosting: ${msg.code}`);
+                    term.writeln(`\r\n\x1b[1;35mSession Created!\r\nShare Code: ${msg.code}\x1b[0m`);
+                    // Auto-fill the code input so user can copy it
+                    shareCodeInput.value = msg.code; 
+                    break;
+                case 'joined':
+                    this.isHost = false;
+                    this.isGuest = true;
+                    updateCollabUI(true, `Joined: ${msg.code}`);
+                    term.writeln(`\r\n\x1b[1;35mJoined Session: ${msg.code}\x1b[0m`);
+                    // Disable local transport controls if we are guest
+                    serialControls.classList.add('hidden');
+                    bleControls.classList.add('hidden');
+                    break;
+                case 'term_data':
+                    if (this.isGuest) {
+                        // Receive output from Host -> Write to Terminal
+                        term.write(msg.data);
+                    } else if (this.isHost) {
+                        // Receive input from Guest -> Write to Local Transport
+                        if (transport) transport.write(msg.data);
+                    }
+                    break;
+                case 'error':
+                    term.writeln(`\r\n\x1b[1;31mCollab Error: ${msg.message}\x1b[0m`);
+                    break;
+            }
+        }
+
+        handleDisconnect() {
+            updateCollabUI(false);
+            term.writeln(`\r\n\x1b[1;33mCollab Disconnected.\x1b[0m`);
+            this.ws = null;
+            this.isHost = false;
+            this.isGuest = false;
+            // Restore controls
+            if (!transport) {
+                serialControls.classList.remove('hidden');
+                bleControls.classList.remove('hidden');
+            }
+        }
+
+        createSession() {
+            if (!this.ws) return;
+            this.ws.send(JSON.stringify({ type: 'create' }));
+        }
+
+        joinSession(code) {
+            if (!this.ws) return;
+            this.ws.send(JSON.stringify({ type: 'join', code: code }));
+        }
+
+        // Called by Host when local transport receives data
+        broadcastOutput(data) {
+            if (this.ws && this.isHost && this.ws.readyState === WebSocket.OPEN) {
+                this.ws.send(JSON.stringify({ type: 'term_data', data: data }));
+            }
+        }
+
+        // Called by Guest when user types
+        sendInput(data) {
+            if (this.ws && this.isGuest && this.ws.readyState === WebSocket.OPEN) {
+                this.ws.send(JSON.stringify({ type: 'term_data', data: data }));
+            }
+        }
+    }
 
     // --- Transport Classes ---
 
@@ -350,6 +470,11 @@
             const decoder = new TextDecoder('utf-8');
             const str = decoder.decode(value);
             term.write(str);
+            
+            // If we are hosting, broadcast this data
+            if (collab && collab.isHost) {
+                collab.broadcastOutput(str);
+            }
         }
 
         async write(data) {
@@ -386,6 +511,57 @@
     connectSerialBtn.addEventListener('click', () => startConnection(new SerialTransport()));
     connectBleBtn.addEventListener('click', () => startConnection(new BLETransport()));
     disconnectBtn.addEventListener('click', disconnect);
+
+    // Collab Listeners
+    shareBtn.addEventListener('click', async () => {
+        await initCollab();
+        collab.createSession();
+    });
+
+    joinBtn.addEventListener('click', async () => {
+        const code = shareCodeInput.value.trim();
+        if (!code) {
+            alert("Please enter a code to join.");
+            return;
+        }
+        await initCollab();
+        collab.joinSession(code);
+    });
+
+    async function initCollab() {
+        if (collab) return; // Already initialized
+        
+        // Use the user-provided URL
+        let url = wsUrlInput.value.trim();
+        if (!url) {
+             // Fallback/Default
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const host = window.location.hostname || 'localhost';
+            url = `${protocol}//${host}:8080`;
+            wsUrlInput.value = url; // Show default back to user
+        }
+        
+        collab = new CollabManager(url);
+        try {
+            await collab.connect();
+            term.writeln(`\r\n\x1b[1;34mConnected to Collaboration Server (${url}).\x1b[0m`);
+        } catch (e) {
+            term.writeln(`\r\n\x1b[1;31mFailed to connect to Collaboration Server at ${url}.\x1b[0m`);
+            collab = null;
+            throw e;
+        }
+    }
+
+    function updateCollabUI(active, text) {
+        if (active) {
+            collabControls.classList.add('hidden'); // Hide buttons
+            collabStatus.textContent = text;
+            collabStatus.classList.remove('hidden');
+        } else {
+            collabControls.classList.remove('hidden');
+            collabStatus.classList.add('hidden');
+        }
+    }
 
     async function startConnection(newTransport) {
         try {
@@ -425,7 +601,6 @@
         
         term.writeln('\r\n\x1b[1;33mDisconnected.\x1b[0m');
     }
-
 </script>
 
 </body>
