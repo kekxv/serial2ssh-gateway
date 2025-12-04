@@ -211,6 +211,44 @@ func runGateway(portName string) {
 	}
 }
 
+// FlowControlWriter wraps an io.Writer and limits the write rate
+// to avoid overflowing the serial port buffer (since HW flow control is disabled).
+type FlowControlWriter struct {
+	Target   io.Writer
+	BaudRate int
+}
+
+func (w *FlowControlWriter) Write(p []byte) (int, error) {
+	// Write in small chunks to smooth out the traffic
+	const chunkSize = 128
+	totalWritten := 0
+
+	for i := 0; i < len(p); i += chunkSize {
+		end := i + chunkSize
+		if end > len(p) {
+			end = len(p)
+		}
+		chunk := p[i:end]
+
+		n, err := w.Target.Write(chunk)
+		if n > 0 {
+			totalWritten += n
+			// Calculate delay based on baud rate:
+			// Time = (Bytes * 10 bits/byte) / BaudRate
+			// 10 bits = Start(1) + Data(8) + Stop(1)
+			bits := int64(n * 10)
+			// Calculate microsecond duration to avoid float math
+			// (bits * 1,000,000) / BaudRate
+			duration := time.Duration(bits*1000000/int64(w.BaudRate)) * time.Microsecond
+			time.Sleep(duration)
+		}
+		if err != nil {
+			return totalWritten, err
+		}
+	}
+	return totalWritten, nil
+}
+
 func connectSSH(serialPort serial.Port, host, user string, authMethods []ssh.AuthMethod) error {
 	config := &ssh.ClientConfig{
 		User: user,
@@ -246,11 +284,14 @@ func connectSSH(serialPort serial.Port, host, user string, authMethods []ssh.Aut
 	}
 
 	// Bridge streams
-	// Directly using serialPort for Stdin/Stdout/Stderr
-	// This ensures binary transparency.
+	// Use FlowControlWriter for Stdout/Stderr to prevent buffer overrun
+	// on the serial port (especially since flow control is disabled).
+	// This ensures binary transparency while respecting baud rate.
+	fcWriter := &FlowControlWriter{Target: serialPort, BaudRate: SerialBaudRate}
+
 	session.Stdin = serialPort
-	session.Stdout = serialPort
-	session.Stderr = serialPort
+	session.Stdout = fcWriter
+	session.Stderr = fcWriter
 
 	// Start Shell
 	if err := session.Shell(); err != nil {
