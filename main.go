@@ -266,8 +266,12 @@ func (w *FlowControlWriter) ClearAbort() {
 
 // InputInterceptor observes serial input to detect Ctrl+C and signal the FlowControlWriter
 type InputInterceptor struct {
-	Source io.Reader
-	Writer *FlowControlWriter
+	Source  io.Reader
+	Writer  *FlowControlWriter
+	OnPanic func() // Callback to force disconnect
+
+	lastCtrlC  time.Time
+	ctrlCCount int
 }
 
 func (i *InputInterceptor) Read(p []byte) (n int, err error) {
@@ -278,6 +282,19 @@ func (i *InputInterceptor) Read(p []byte) (n int, err error) {
 
 	for j := 0; j < n; j++ {
 		if p[j] == 0x03 { // Ctrl+C
+			// Panic detection: 5 times in 2 seconds
+			now := time.Now()
+			if now.Sub(i.lastCtrlC) < 2*time.Second {
+				i.ctrlCCount++
+			} else {
+				i.ctrlCCount = 1
+			}
+			i.lastCtrlC = now
+
+			if i.ctrlCCount >= 5 && i.OnPanic != nil {
+				i.OnPanic()
+			}
+
 			i.Writer.Abort()
 			// Auto-clear after a short delay (100ms).
 			// This is enough time to "drain" the SSH stdout buffers at CPU speed,
@@ -288,6 +305,10 @@ func (i *InputInterceptor) Read(p []byte) (n int, err error) {
 		} else if p[j] != 0x00 {
 			// Any other meaningful input also clears the abort flag immediately
 			i.Writer.ClearAbort()
+			// Reset panic counter on other inputs
+			if p[j] != 0x03 {
+				i.ctrlCCount = 0
+			}
 		}
 	}
 	return n, err
@@ -332,7 +353,14 @@ func connectSSH(serialPort serial.Port, host, user string, authMethods []ssh.Aut
 	// on the serial port (especially since flow control is disabled).
 	// This ensures binary transparency while respecting baud rate.
 	fcWriter := &FlowControlWriter{Target: serialPort, BaudRate: SerialBaudRate}
-	inputInterceptor := &InputInterceptor{Source: serialPort, Writer: fcWriter}
+	inputInterceptor := &InputInterceptor{
+		Source: serialPort,
+		Writer: fcWriter,
+		OnPanic: func() {
+			sendLog("Panic detected: Multiple Ctrl+C. Force disconnecting session...")
+			client.Close()
+		},
+	}
 
 	session.Stdin = inputInterceptor
 	session.Stdout = fcWriter
