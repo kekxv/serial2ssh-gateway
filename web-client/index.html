@@ -119,6 +119,7 @@
     <!-- Active Session Controls (Hidden until connected) -->
     <div id="activeSessionControls" class="hidden" style="display: flex; gap: 10px; align-items: center;">
         <div class="separator"></div>
+        <button id="syncSizeBtn" title="Sync Terminal Size">Sync Size 🔄</button>
         <button id="sendKeyBtn" title="Upload Private Key File" style="background-color: #238636;">Key 🔑</button>
         <input type="file" id="keyFileUpload" style="display: none;" />
     </div>
@@ -167,6 +168,7 @@
     const connectSerialBtn = document.getElementById('connectSerialBtn');
     const connectBleBtn = document.getElementById('connectBleBtn');
     const disconnectBtn = document.getElementById('disconnectBtn');
+    const syncSizeBtn = document.getElementById('syncSizeBtn');
     const baudRateSelect = document.getElementById('baudRate');
     const statusMsg = document.getElementById('statusMsg');
     const termContainer = document.getElementById('terminal-container');
@@ -362,6 +364,16 @@
                     if (done) break;
                     if (value) {
                         term.write(value); // xterm.js can handle Uint8Array
+                        
+                        // Auto-sync size when session starts
+                        const decoded = new TextDecoder().decode(value);
+                        if (decoded.includes("--- SSH Session Established ---")) {
+                            setTimeout(() => {
+                                const cmd = `stty rows ${term.rows} cols ${term.cols}\n`;
+                                this.write(cmd);
+                            }, 500); // Small delay to let the shell settle
+                        }
+
                         // If we are hosting, broadcast this data as a string
                         if (collab && collab.isHost) {
                             const decodedString = new TextDecoder('utf-8').decode(value);
@@ -394,7 +406,7 @@
         async disconnect() {
             if (this.reader) {
                 await this.reader.cancel();
-                await this.inputDone.catch(() => {});
+                this.inputDone && await this.inputDone.catch(() => {});
                 this.reader = null;
                 this.inputDone = null;
             }
@@ -496,6 +508,15 @@
             const value = event.target.value; // This is a DataView
             const uint8Array = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
             term.write(uint8Array); // xterm.js can handle Uint8Array
+
+            // Auto-sync size when session starts
+            const decoded = new TextDecoder().decode(uint8Array);
+            if (decoded.includes("--- SSH Session Established ---")) {
+                setTimeout(() => {
+                    const cmd = `stty rows ${term.rows} cols ${term.cols}\n`;
+                    this.write(cmd);
+                }, 500);
+            }
             
             // If we are hosting, broadcast this data as a string
             if (collab && collab.isHost) {
@@ -547,6 +568,19 @@
     connectSerialBtn.addEventListener('click', () => startConnection(new SerialTransport()));
     connectBleBtn.addEventListener('click', () => startConnection(new BLETransport()));
     disconnectBtn.addEventListener('click', disconnect);
+
+    // Sync Terminal Size Logic
+    syncSizeBtn.addEventListener('click', () => {
+        if (transport && transport.write) {
+            // Get dimensions from xterm.js
+            const cols = term.cols;
+            const rows = term.rows;
+            const cmd = `stty rows ${rows} cols ${cols}\n`;
+            
+            term.writeln(`\r\n\x1b[1;34mSyncing size: ${rows}x${cols}...\x1b[0m`);
+            transport.write(cmd);
+        }
+    });
 
     // Key Upload Logic
     const sendKeyBtn = document.getElementById('sendKeyBtn');

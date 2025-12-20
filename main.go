@@ -373,6 +373,10 @@ func connectSSH(serialPort serial.Port, host, user string, authMethods []ssh.Aut
 
 	sendLog("Session established: %s", host)
 
+	// Notify the serial terminal that the session is ready
+	writeSerial(serialPort, "\r\n\x1b[1;32m--- SSH Session Established ---\x1b[0m\r\n")
+	writeSerial(serialPort, "\x1b[1;34mTip: If the screen is misaligned, press 'Sync Size' or run 'stty rows 25 cols 80'\x1b[0m\r\n\r\n")
+
 	// Wait for session to end
 	return session.Wait()
 }
