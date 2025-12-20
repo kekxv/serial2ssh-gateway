@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.bug.st/serial"
@@ -216,14 +217,25 @@ func runGateway(portName string) {
 type FlowControlWriter struct {
 	Target   io.Writer
 	BaudRate int
+	aborted  int32
 }
 
 func (w *FlowControlWriter) Write(p []byte) (int, error) {
+	// If already aborted, drop the data immediately
+	if atomic.LoadInt32(&w.aborted) == 1 {
+		return len(p), nil
+	}
+
 	// Write in small chunks to smooth out the traffic
 	const chunkSize = 128
 	totalWritten := 0
 
 	for i := 0; i < len(p); i += chunkSize {
+		// Check for abort signal before each chunk
+		if atomic.LoadInt32(&w.aborted) == 1 {
+			return len(p), nil
+		}
+
 		end := i + chunkSize
 		if end > len(p) {
 			end = len(p)
@@ -233,12 +245,7 @@ func (w *FlowControlWriter) Write(p []byte) (int, error) {
 		n, err := w.Target.Write(chunk)
 		if n > 0 {
 			totalWritten += n
-			// Calculate delay based on baud rate:
-			// Time = (Bytes * 10 bits/byte) / BaudRate
-			// 10 bits = Start(1) + Data(8) + Stop(1)
 			bits := int64(n * 10)
-			// Calculate microsecond duration to avoid float math
-			// (bits * 1,000,000) / BaudRate
 			duration := time.Duration(bits*1000000/int64(w.BaudRate)) * time.Microsecond
 			time.Sleep(duration)
 		}
@@ -247,6 +254,43 @@ func (w *FlowControlWriter) Write(p []byte) (int, error) {
 		}
 	}
 	return totalWritten, nil
+}
+
+func (w *FlowControlWriter) Abort() {
+	atomic.StoreInt32(&w.aborted, 1)
+}
+
+func (w *FlowControlWriter) ClearAbort() {
+	atomic.StoreInt32(&w.aborted, 0)
+}
+
+// InputInterceptor observes serial input to detect Ctrl+C and signal the FlowControlWriter
+type InputInterceptor struct {
+	Source io.Reader
+	Writer *FlowControlWriter
+}
+
+func (i *InputInterceptor) Read(p []byte) (n int, err error) {
+	n, err = i.Source.Read(p)
+	if err != nil {
+		return n, err
+	}
+
+	for j := 0; j < n; j++ {
+		if p[j] == 0x03 { // Ctrl+C
+			i.Writer.Abort()
+			// Auto-clear after a short delay (100ms).
+			// This is enough time to "drain" the SSH stdout buffers at CPU speed,
+			// but short enough that the subsequent shell prompt won't be missed.
+			time.AfterFunc(100*time.Millisecond, func() {
+				i.Writer.ClearAbort()
+			})
+		} else if p[j] != 0x00 {
+			// Any other meaningful input also clears the abort flag immediately
+			i.Writer.ClearAbort()
+		}
+	}
+	return n, err
 }
 
 func connectSSH(serialPort serial.Port, host, user string, authMethods []ssh.AuthMethod) error {
@@ -288,8 +332,9 @@ func connectSSH(serialPort serial.Port, host, user string, authMethods []ssh.Aut
 	// on the serial port (especially since flow control is disabled).
 	// This ensures binary transparency while respecting baud rate.
 	fcWriter := &FlowControlWriter{Target: serialPort, BaudRate: SerialBaudRate}
+	inputInterceptor := &InputInterceptor{Source: serialPort, Writer: fcWriter}
 
-	session.Stdin = serialPort
+	session.Stdin = inputInterceptor
 	session.Stdout = fcWriter
 	session.Stderr = fcWriter
 
