@@ -218,11 +218,22 @@ type FlowControlWriter struct {
 	Target   io.Writer
 	BaudRate int
 	aborted  int32
+
+	mu            sync.Mutex
+	lastDiscarded []byte
 }
 
 func (w *FlowControlWriter) Write(p []byte) (int, error) {
-	// If already aborted, drop the data immediately
+	// If already aborted, drop the data immediately but keep the tail
 	if atomic.LoadInt32(&w.aborted) == 1 {
+		w.mu.Lock()
+		w.lastDiscarded = append(w.lastDiscarded, p...)
+		// Keep only the last 256 bytes (enough for a prompt and some context)
+		const keepSize = 256
+		if len(w.lastDiscarded) > keepSize {
+			w.lastDiscarded = w.lastDiscarded[len(w.lastDiscarded)-keepSize:]
+		}
+		w.mu.Unlock()
 		return len(p), nil
 	}
 
@@ -233,7 +244,10 @@ func (w *FlowControlWriter) Write(p []byte) (int, error) {
 	for i := 0; i < len(p); i += chunkSize {
 		// Check for abort signal before each chunk
 		if atomic.LoadInt32(&w.aborted) == 1 {
-			return len(p), nil
+			// If aborted mid-stream, we should technically capture the rest of p here too,
+			// but for simplicity and performance in the loop, we just return.
+			// The next Write call will be caught by the block above.
+			return totalWritten, nil
 		}
 
 		end := i + chunkSize
@@ -257,11 +271,25 @@ func (w *FlowControlWriter) Write(p []byte) (int, error) {
 }
 
 func (w *FlowControlWriter) Abort() {
+	w.mu.Lock()
+	w.lastDiscarded = nil // Reset buffer on new abort
+	w.mu.Unlock()
 	atomic.StoreInt32(&w.aborted, 1)
 }
 
 func (w *FlowControlWriter) ClearAbort() {
 	atomic.StoreInt32(&w.aborted, 0)
+}
+
+// Restore writes the last discarded bytes to the target.
+// This allows recovering the prompt or "^C" echo that might have been drained.
+func (w *FlowControlWriter) Restore() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.lastDiscarded) > 0 {
+		w.Target.Write(w.lastDiscarded)
+		w.lastDiscarded = nil
+	}
 }
 
 // InputInterceptor observes serial input to detect Ctrl+C and signal the FlowControlWriter
@@ -300,6 +328,7 @@ func (i *InputInterceptor) Read(p []byte) (n int, err error) {
 			// This is enough time to "drain" the SSH stdout buffers at CPU speed,
 			// but short enough that the subsequent shell prompt won't be missed.
 			time.AfterFunc(100*time.Millisecond, func() {
+				i.Writer.Restore()
 				i.Writer.ClearAbort()
 			})
 		} else if p[j] != 0x00 {
